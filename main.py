@@ -1,71 +1,174 @@
+import os
 import subprocess
 import torch
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-import librosa
-import os
-
-# YouTube video URL
-youtube_url = "https://youtu.be/_3JJnfAoOt4"
-
-# Define output audio file path
-output_audio = "downloaded_audio.mp3"
+from transformers.models.auto.modeling_auto import AutoModelForSpeechSeq2Seq
+from transformers.models.auto.processing_auto import AutoProcessor
+from transformers.pipelines import pipeline
 
 
-# Function to download audio using yt-dlp
-def download_audio(url, output_path):
+def download_audio(url, output_dir="downloads"):
+    """
+    Download audio from video URL using yt-dlp
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Use yt-dlp to download audio
     command = [
         "yt-dlp",
-        "-x",  # Extract audio
+        "--extract-audio",
         "--audio-format",
-        "mp3",  # Convert to MP3 format
-        "-o",
-        output_path,  # Output file path
+        "wav",  # Using WAV format for better compatibility
+        "--audio-quality",
+        "0",
+        "--output",
+        f"{output_dir}/%(title)s.%(ext)s",
         url,
     ]
+
     try:
+        print(f"Downloading audio: {url}")
         subprocess.run(command, check=True)
-        print(f"Audio downloaded successfully to {output_path}")
-        return True
+
+        # Find the downloaded file in the output directory
+        files = os.listdir(output_dir)
+        if not files:
+            print(f"No files found in {output_dir}")
+            return None
+
+        # Get the first audio file in the directory (should be our downloaded file)
+        audio_file = os.path.join(output_dir, files[0])
+        print(f"Found audio file: {audio_file}")
+
+        # Check if file exists
+        if os.path.exists(audio_file):
+            return audio_file
+        else:
+            print(f"File doesn't exist: {audio_file}")
+            return None
+
     except subprocess.CalledProcessError as e:
-        print(f"Failed to download audio: {e}")
-        return False
+        print(f"Download failed: {e}")
+        return None
 
 
-# Load Whisper processor and model
-processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3")
+def transcribe_audio(audio_file, output_dir="transcripts"):
+    """
+    Transcribe audio file using Whisper model
+    """
+    # Verify file exists before proceeding
+    if not os.path.exists(audio_file):
+        print(f"Error: Audio file not found: {audio_file}")
+        return None
 
-# Set model to evaluation mode
-model.eval()
-print("Whisper model loaded and set to evaluation mode")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-# Download audio
-if download_audio(youtube_url, output_audio):
-    # Load the downloaded audio file
-    print("Loading audio file...")
-    audio, sampling_rate = librosa.load(
-        output_audio, sr=16000
-    )  # Whisper requires 16kHz sampling rate
-    print("Audio file loaded successfully")
+    # Check if CUDA is available
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    # Process audio input
-    print("Processing audio for transcription...")
-    input_features = processor(
-        audio, sampling_rate=16000, return_tensors="pt"
-    ).input_features
+    print(f"Using device: {device}")
 
-    # Generate transcription
-    print("Generating transcription...")
-    with torch.no_grad():
-        generated_ids = model.generate(input_features)
+    # Load Whisper model
+    model_id = "openai/whisper-large-v3"
 
-    # Decode transcription
-    transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    print("Transcription completed!")
-    print("Transcription result:", transcription)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
+    )
+    model.to(device)
 
-    # Clean up downloaded audio file (optional)
-    os.remove(output_audio)
-    print(f"Temporary audio file deleted: {output_audio}")
-else:
-    print("Transcription cannot proceed due to audio download failure.")
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    # Create transcription pipeline with fixed warning
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        chunk_length_s=30,
+        batch_size=16,
+        return_timestamps=True,
+        torch_dtype=torch_dtype,
+        device=device,
+        generate_kwargs={"max_new_tokens": 128, "task": "transcribe"},  # Fixed warning
+    )
+
+    # Transcribe audio (with automatic language detection)
+    print(f"Transcribing audio: {audio_file}")
+    result = pipe(audio_file)
+
+    # Save transcription results
+    base_name = os.path.basename(audio_file)
+    file_name = os.path.splitext(base_name)[0]
+    output_file = f"{output_dir}/{file_name}_transcript.txt"
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        # Process different result formats
+        if isinstance(result, dict):
+            if "chunks" in result:
+                # Process chunks with timestamps
+                for chunk in result["chunks"]:
+                    if (
+                        isinstance(chunk, dict)
+                        and "timestamp" in chunk
+                        and "text" in chunk
+                    ):
+                        start = chunk["timestamp"][0]
+                        end = chunk["timestamp"][1]
+                        text = chunk["text"]
+                        f.write(
+                            f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}\n"
+                        )
+            elif "text" in result:
+                # Extract text field from dictionary
+                f.write(result["text"])
+            else:
+                # Convert dict to string if no recognized format
+                f.write(str(result))
+        elif isinstance(result, str):
+            # Direct string output
+            f.write(result)
+        elif isinstance(result, list):
+            # Handle list results (could be list of transcriptions or segments)
+            for item in result:
+                if isinstance(item, dict) and "text" in item:
+                    f.write(item["text"] + "\n")
+                else:
+                    f.write(str(item) + "\n")
+        else:
+            # Fallback for any other type
+            f.write(str(result))
+
+    print(f"Transcription completed, saved to: {output_file}")
+    return output_file
+
+
+def format_timestamp(seconds):
+    """Convert seconds to HH:MM:SS format"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def main():
+    # YouTube video URL to download
+    url = "https://youtu.be/_3JJnfAoOt4"
+
+    # Download audio
+    audio_file = download_audio(url)
+    if audio_file:
+        print(f"Successfully downloaded audio to: {audio_file}")
+        # Transcribe audio
+        transcript_file = transcribe_audio(audio_file)
+        if transcript_file:
+            print(f"Process completed. Transcript saved as: {transcript_file}")
+        else:
+            print("Transcription failed.")
+    else:
+        print("Cannot continue because audio download failed.")
+
+
+if __name__ == "__main__":
+    main()
