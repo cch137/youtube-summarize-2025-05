@@ -18,7 +18,7 @@ def download_audio(url, output_dir="downloads"):
         "yt-dlp",
         "--extract-audio",
         "--audio-format",
-        "wav",  # Using WAV format for better compatibility
+        "mp3",  # or: wav
         "--audio-quality",
         "0",
         "--output",
@@ -71,7 +71,8 @@ def transcribe_audio(audio_file, output_dir="transcripts"):
     print(f"Using device: {device}")
 
     # Load Whisper model
-    model_id = "openai/whisper-large-v3"
+    # model_id = "openai/whisper-large-v3"
+    model_id = "openai/whisper-small"
 
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
